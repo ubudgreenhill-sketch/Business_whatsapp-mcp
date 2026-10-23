@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-business-mcp",
+  "version": "1.0.0",
+  "description": "WhatsApp Business MCP connector for Claude (QR-linked) with group files -> Google Drive",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "express": "^5.3.0",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4",
+    "zod": "^4.6.7"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
+}
