@@ -566,7 +566,8 @@ app.get(`/qr/${SECRET}`, async (_req, res) => {
     const img = await QRCode.toDataURL(state.qr, { width: 320, margin: 2 })
     body = `<h2>Отсканируйте QR-код</h2>
       <p>WhatsApp на телефоне → Настройки → Связанные устройства → Привязка устройства</p>
-      <img src="${img}" alt="QR" /><p style="color:#888">Код обновляется автоматически.</p>`
+      <img src="${img}" alt="QR" /><p style="color:#888">Код обновляется автоматически.</p>
+      <p>Не получается отсканировать? <a href="/pair/${SECRET}">Привязать по номеру телефона</a></p>`
   } else {
     body = `<h2>Подождите…</h2><p>Статус: ${state.connection}</p>`
   }
@@ -574,6 +575,39 @@ app.get(`/qr/${SECRET}`, async (_req, res) => {
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta http-equiv="refresh" content="${state.connection === 'open' ? 30 : 8}">
     <title>WhatsApp link</title>
+    <style>body{font-family:system-ui,sans-serif;text-align:center;padding:24px;background:#fff;color:#111}</style>
+    </head><body>${body}</body></html>`)
+})
+
+// Link by phone number (pairing code) — alternative to the QR code
+const escHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+app.get(`/pair/${SECRET}`, async (req, res) => {
+  const phone = String(req.query.phone || '').replace(/[^\d]/g, '')
+  let body
+  if (state.connection === 'open') {
+    body = `<h2>✅ WhatsApp подключён</h2><p>${escHtml(state.me?.name || '')} ${escHtml(state.me?.id?.split(':')[0] || '')}</p>`
+  } else if (!phone) {
+    body = `<h2>Привязка по номеру телефона</h2>
+      <form method="get"><p>Номер WhatsApp Business в международном формате, только цифры:</p>
+      <input name="phone" inputmode="numeric" placeholder="6281234567890" style="font-size:20px;padding:8px;width:260px">
+      <p><button style="font-size:18px;padding:8px 16px">Получить код</button></p></form>`
+  } else if (!sock || !state.qr) {
+    body = `<h2>Подождите…</h2><p>Статус: ${escHtml(state.connection)}. Обновите страницу через несколько секунд.</p>`
+  } else {
+    try {
+      const code = await sock.requestPairingCode(phone)
+      const pretty = String(code).replace(/^(.{4})(.{4})$/, '$1-$2')
+      body = `<h2>Код привязки</h2><p style="font-size:44px;letter-spacing:6px;font-weight:700">${escHtml(pretty)}</p>
+        <p>На телефоне: WhatsApp Business → Настройки → Связанные устройства → Привязка устройства →
+        <b>«Привязать по номеру телефона»</b> (внизу экрана сканера) и введите этот код.</p>
+        <p style="color:#888">Код действует около минуты. Если не успели — обновите страницу.</p>
+        <p><a href="/qr/${encodeURIComponent(SECRET)}">Проверить статус</a></p>`
+    } catch (e) {
+      body = `<h2>Ошибка</h2><p>${escHtml(e?.message || e)}</p><p>Обновите страницу и попробуйте ещё раз.</p>`
+    }
+  }
+  res.set('cache-control', 'no-store').type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp pairing</title>
     <style>body{font-family:system-ui,sans-serif;text-align:center;padding:24px;background:#fff;color:#111}</style>
     </head><body>${body}</body></html>`)
 })
