@@ -359,7 +359,15 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     if (downloadMedia) return downloadMedia(msg, sock)
     const { downloadMediaMessage } = await import('@whiskeysockets/baileys')
     const quiet = { level: 'silent', trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return quiet } }
-    return downloadMediaMessage(msg, 'buffer', {}, { logger: quiet, reuploadRequest: m => sock.updateMediaMessage(m) })
+    const ctx = { logger: quiet, reuploadRequest: m => sock.updateMediaMessage(m) }
+    try {
+      return await downloadMediaMessage(msg, 'buffer', {}, ctx)
+    } catch (e) {
+      // старые файлы: ссылка на сервере WhatsApp истекла — просим телефон загрузить файл заново
+      if (!sock?.updateMediaMessage) throw e
+      const fresh = await sock.updateMediaMessage(msg)
+      return downloadMediaMessage(fresh, 'buffer', {}, ctx)
+    }
   }
 
   async function pump() {
