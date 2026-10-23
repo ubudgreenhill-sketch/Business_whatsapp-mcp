@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { z } from 'zod'
+import ExcelJS from 'exceljs'
 
 const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink&supportsAllDrives=true'
 const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files'
@@ -114,7 +115,7 @@ export function createGroupWatcher({ dataDir, secret, publicUrl, logger = consol
   const baseUrl = (publicUrl || process.env.PUBLIC_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')).replace(/\/$/, '')
   const redirectUri = `${baseUrl}/gdrive/callback`
 
-  let state = { google: null, groups: {}, seen: [] }
+  let state = { google: null, groups: {}, seen: [], weekly: [], exported: {} }
   try { state = { ...state, ...JSON.parse(fs.readFileSync(statePath, 'utf8')) } } catch {}
   const seen = new Set(state.seen)
   let sock = null
@@ -167,6 +168,81 @@ export function createGroupWatcher({ dataDir, secret, publicUrl, logger = consol
     return f
   }
 
+  // ---------- Excel-файлы на Drive (чтение и правка на месте, ID файла не меняется) ----------
+  const fileIdFrom = s => {
+    const t = String(s || '').trim()
+    const m = t.match(/\/d\/([A-Za-z0-9_-]{10,})/) || t.match(/[?&]id=([A-Za-z0-9_-]{10,})/)
+    return m ? m[1] : t
+  }
+  async function loadXlsx(file) {
+    const id = fileIdFrom(file)
+    const token = await getAccessToken()
+    const meta = await driveJson(`${DRIVE_FILES}/${encodeURIComponent(id)}?fields=id,name,mimeType,headRevisionId&supportsAllDrives=true`)
+    if (!/spreadsheetml|excel/.test(meta.mimeType)) throw new Error(`${meta.name}: это не .xlsx (${meta.mimeType})`)
+    const r = await fetch(`${DRIVE_FILES}/${encodeURIComponent(id)}?alt=media&supportsAllDrives=true`, { headers: { authorization: `Bearer ${token}` } })
+    if (!r.ok) throw new Error(`Drive ${r.status}: не удалось скачать файл`)
+    const wb = new ExcelJS.Workbook()
+    await wb.xlsx.load(Buffer.from(await r.arrayBuffer()))
+    return { id, meta, wb }
+  }
+  const cellOut = c => {
+    const v = c.value
+    if (v == null) return undefined
+    if (typeof v === 'object' && !(v instanceof Date)) {
+      if ('formula' in v || 'sharedFormula' in v) return { f: v.formula || v.sharedFormula, v: v.result instanceof Date ? v.result.toISOString().slice(0, 10) : v.result }
+      if ('richText' in v) return v.richText.map(t => t.text).join('')
+      if ('text' in v) return v.text
+      return JSON.stringify(v)
+    }
+    return v instanceof Date ? v.toISOString().slice(0, 10) : v
+  }
+  async function xlsxRead({ file, sheet, from_row, to_row }) {
+    const { meta, wb } = await loadXlsx(file)
+    const ws = sheet ? wb.getWorksheet(sheet) : wb.worksheets[0]
+    if (!ws) throw new Error(`Нет листа «${sheet}». Листы: ${wb.worksheets.map(w => w.name).join(', ')}`)
+    const a = Math.max(1, from_row || 1), b = Math.min(ws.rowCount, to_row || ws.rowCount, a + 299)
+    const rows = []
+    for (let i = a; i <= b; i++) {
+      const r = ws.getRow(i), cells = {}
+      r.eachCell({ includeEmpty: false }, c => { const o = cellOut(c); if (o !== undefined && o !== '') cells[c.address.replace(/\d+$/, '')] = o })
+      if (Object.keys(cells).length) rows.push({ row: i, cells })
+    }
+    return { file: meta.name, sheets: wb.worksheets.map(w => `${w.name} (${w.rowCount} rows)`), sheet: ws.name, row_count: ws.rowCount, merged: ws.model.merges?.slice(0, 30), rows }
+  }
+  async function xlsxUpdate({ file, sheet, insert_rows, cells }) {
+    const { id, meta, wb } = await loadXlsx(file)
+    const ws = sheet ? wb.getWorksheet(sheet) : wb.worksheets[0]
+    if (!ws) throw new Error(`Нет листа «${sheet}»`)
+    if (insert_rows) {
+      const { before_row, count, style_from_row } = insert_rows
+      const src = ws.getRow(style_from_row || Math.max(1, before_row - 1))
+      const styles = []; src.eachCell({ includeEmpty: true }, (c, n) => { styles[n] = JSON.parse(JSON.stringify(c.style || {})) })
+      const height = src.height
+      ws.spliceRows(before_row, 0, ...Array.from({ length: count }, () => []))
+      for (let k = 0; k < count; k++) {
+        const r = ws.getRow(before_row + k)
+        styles.forEach((st, n) => { if (st) r.getCell(n).style = JSON.parse(JSON.stringify(st)) })
+        if (height) r.height = height
+      }
+    }
+    let n = 0
+    for (const c of cells || []) {
+      const cell = ws.getCell(c.ref)
+      if (c.formula != null) cell.value = { formula: String(c.formula).replace(/^=/, '') }
+      else if (c.date) cell.value = new Date(`${c.date}T00:00:00Z`)
+      else cell.value = c.value ?? null
+      n++
+    }
+    const buf = Buffer.from(await wb.xlsx.writeBuffer())
+    const token = await getAccessToken()
+    const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(id)}?uploadType=media&supportsAllDrives=true&fields=id,name,modifiedTime`, {
+      method: 'PATCH', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: buf,
+    })
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) throw new Error(`Drive ${r.status}: ${j.error?.message || 'не удалось сохранить'}`)
+    return { file: meta.name, sheet: ws.name, inserted_rows: insert_rows?.count || 0, cells_written: n, saved_at: j.modifiedTime, previous_revision: meta.headRevisionId }
+  }
+
   async function uploadFile({ folderId, name, mimetype, buffer, description }) {
     const boundary = 'wa' + crypto.randomBytes(12).toString('hex')
     const meta = JSON.stringify({ name, parents: [folderId], ...(description ? { description } : {}) })
@@ -210,11 +286,19 @@ export function createGroupWatcher({ dataDir, secret, publicUrl, logger = consol
 <div class="name">Добавить контакт</div>
 <div class="ctl"><input name="phone" inputmode="tel" placeholder="Номер, напр. +62 812 3456 7890" style="min-width:180px"><input name="label" placeholder="Имя (необязательно)" style="min-width:140px"></div>
 <div class="ctl"><input name="folder" placeholder="Ссылка на папку Google Drive"><button>Добавить</button></div></form>`
-    const rows = `<h2>Контакты</h2>${contacts.map(row).join('')}${addContact}<h2>Группы</h2>${groups.map(row).join('') || '<p>Групп пока нет.</p>'}`
+    const weeklyRows = (state.weekly || []).map((j, i) => `<form method="post" class="row"><input type="hidden" name="action" value="weekly_remove"><input type="hidden" name="idx" value="${i}">
+<div class="name">${esc(j.name)} → <a href="${esc(j.folderLink)}" target="_blank" rel="noreferrer">${esc(j.folderName)}</a></div>
+<div class="cur">Каждую пятницу в 18:00 (Бали): новые документы и фото за прошедшую неделю.${j.lastRun ? ` Последний запуск: ${esc(j.lastRun)} — ${esc(j.lastResult || '')}` : ' Ещё не запускался.'}</div>
+<div class="ctl"><button name="sub" value="run">Запустить сейчас</button><button class="danger">Удалить</button></div></form>`).join('')
+    const weeklyAdd = `<form method="post" class="row"><input type="hidden" name="action" value="weekly_add">
+<div class="name">Добавить еженедельный сбор</div>
+<div class="ctl"><select name="group_id">${groups.filter(g => g.id.endsWith('@g.us')).map(g => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('')}</select></div>
+<div class="ctl"><input name="folder" placeholder="Ссылка на папку Google Drive"><button>Добавить</button></div></form>`
+    const rows = `<h2>Еженедельный сбор (пятница, 18:00)</h2>${weeklyRows}${weeklyAdd}<h2>Контакты</h2>${contacts.map(row).join('')}${addContact}<h2>Группы</h2>${groups.map(row).join('') || '<p>Групп пока нет.</p>'}`
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
     res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Группы → папки</title>
 <style>body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px;color:#222}h1{font-size:20px}h2{font-size:17px;margin:22px 0 6px}.row{border:1px solid #ddd;border-radius:8px;padding:10px 12px;margin:8px 0}
-.name{font-weight:600}.cur{margin:4px 0;color:#555}.ctl{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.ctl input{flex:1;min-width:200px;padding:6px}button{padding:6px 10px;cursor:pointer}
+.name{font-weight:600}.cur{margin:4px 0;color:#555}.ctl{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.ctl input,.ctl select{flex:1;min-width:200px;padding:6px}button{padding:6px 10px;cursor:pointer}
 .danger{color:#b00}.msg{padding:8px 12px;border-radius:6px;background:#eef6ee}.msg.bad{background:#fbeaea}.err{color:#b00}</style>
 <h1>WhatsApp → папки Google Drive</h1><p>${drive}</p>
 <p>Откройте нужную папку в Google Drive, скопируйте адрес из браузера, вставьте напротив группы или контакта и нажмите «Сохранить». Из этого чата будут сохраняться новые документы и фото (и входящие, и ваши).</p>
@@ -224,6 +308,27 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
   async function handleSettingsPost(req) {
     const f = await readForm(req)
     if (f.action === 'add_contact') return addContact(f)
+    if (f.action === 'weekly_add') {
+      const gid = String(f.group_id || '')
+      if (!gid.endsWith('@g.us')) return { bad: true, text: 'Выберите группу' }
+      const folderId = parseFolderId(f.folder)
+      if (!folderId) return { bad: true, text: 'Не похоже на ссылку на папку Google Drive' }
+      let folder
+      try { folder = await getFolder(folderId) } catch (e) { return { bad: true, text: `Папка недоступна: ${e.message}` } }
+      let name = gid
+      try { name = (await sock?.groupMetadata(gid))?.subject || gid } catch {}
+      state.weekly = (state.weekly || []).filter(j => j.chat !== gid)
+      state.weekly.push({ chat: gid, name, folderId: folder.id, folderName: folder.name, folderLink: folder.webViewLink, created: new Date().toISOString() })
+      save()
+      return { text: `Еженедельный сбор: «${name}» → «${folder.name}», по пятницам в 18:00` }
+    }
+    if (f.action === 'weekly_remove') {
+      const j = (state.weekly || [])[Number(f.idx)]
+      if (!j) return { bad: true, text: 'Не найдено' }
+      if (f.sub === 'run') { const r = await runWeekly(j, true); return { text: `«${j.name}»: ${r}` } }
+      state.weekly.splice(Number(f.idx), 1); save()
+      return { text: `Еженедельный сбор «${j.name}» удалён` }
+    }
     const id = String(f.group_id || '')
     if (!/@(g\.us|s\.whatsapp\.net|lid)$/.test(id)) return { bad: true, text: 'Неверный чат' }
     const g = state.groups[id]
@@ -365,7 +470,10 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     } catch (e) {
       // старые файлы: ссылка на сервере WhatsApp истекла — просим телефон загрузить файл заново
       if (!sock?.updateMediaMessage) throw e
-      const fresh = await sock.updateMediaMessage(msg)
+      const fresh = await Promise.race([
+        sock.updateMediaMessage(msg),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('телефон не прислал файл заново за 45 с (файл старый; откройте WhatsApp Business на телефоне и повторите)')), 45_000)),
+      ])
       return downloadMediaMessage(fresh, 'buffer', {}, ctx)
     }
   }
@@ -519,13 +627,54 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
         const buffer = await downloadBuffer(m.raw)
         const name = buildFileName({ ts: m.ts, sender: m.sender, media: { kind: m.kind, mimetype: m.mimetype, fileName: m.fileName, caption: m.caption }, msgId: id, tz: timeZone })
         const up = await uploadFile({ folderId: f.id, name, mimetype: m.mimetype, buffer, description: m.caption ? `Подпись: ${m.caption}` : undefined })
+        state.exported = state.exported || {}
+        state.exported[`${chatJid}|${id}`] = new Date().toISOString()
         results.push({ message_id: id, ok: true, name: up.name, link: up.webViewLink })
       } catch (e) {
         results.push({ message_id: id, ok: false, file_name: m.fileName, error: String(e.message || e) })
       }
     }
+    save()
     return { folder: f.name, folder_link: f.webViewLink, uploaded: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, results }
   }
+
+  // ---------- еженедельный сбор: пятница 18:00 по Бали ----------
+  const localParts = d => Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone, weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).formatToParts(d).map(p => [p.type, p.value]))
+  async function runWeekly(job, manual = false) {
+    const nowTs = Math.floor(Date.now() / 1000)
+    const since = nowTs - 7 * 86400
+    const ex = state.exported || {}
+    const files = Object.entries(mediaIdx.chats[job.chat] || {})
+      .filter(([id, m]) => m.ts >= since && m.ts <= nowTs && !ex[`${job.chat}|${id}`])
+      .sort((a, b) => a[1].ts - b[1].ts).map(([id]) => id)
+    let text
+    if (!files.length) text = 'новых файлов нет'
+    else {
+      const r = await exportFiles({ chatJid: job.chat, ids: files, folder: job.folderId })
+      text = `загружено ${r.uploaded}${r.failed ? `, ошибок ${r.failed}` : ''}`
+    }
+    const p = localParts(new Date())
+    job.lastRun = `${p.year}-${p.month}-${p.day} ${p.hour}:00${manual ? ' (вручную)' : ''}`
+    job.lastRunDay = manual ? job.lastRunDay : `${p.year}-${p.month}-${p.day}`
+    job.lastResult = text
+    save()
+    logger.info?.(`[group-watcher] weekly ${job.name}: ${text}`)
+    return text
+  }
+  let weeklyBusy = false
+  setInterval(async () => {
+    if (weeklyBusy || !sock || !state.google?.refresh_token) return
+    const p = localParts(new Date())
+    if (p.weekday !== 'Fri' || Number(p.hour === '24' ? 0 : p.hour) < 18) return
+    const day = `${p.year}-${p.month}-${p.day}`
+    weeklyBusy = true
+    try {
+      for (const job of state.weekly || []) {
+        if (job.lastRunDay === day) continue
+        try { await runWeekly(job) } catch (e) { job.lastResult = `ошибка: ${e.message}`; job.lastRunDay = day; save() }
+      }
+    } finally { weeklyBusy = false }
+  }, 5 * 60_000).unref?.()
 
   function attach(newSock) {
     sock = newSock
@@ -546,6 +695,7 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
         google_drive_connected: !!state.google?.refresh_token,
         connect_url: state.google?.refresh_token ? undefined : `${baseUrl}/gdrive/connect/<SECRET>`,
         settings: 'Папки для групп и контактов назначаются только вручную на странице /groups/<SECRET>',
+        weekly_collection: (state.weekly || []).map(j => ({ chat: j.name, chat_id: j.chat, folder: j.folderName, folder_link: j.folderLink, schedule: 'пятница 18:00 (Бали), файлы за 7 дней, только ещё не выгруженные', last_run: j.lastRun || null, last_result: j.lastResult || null })),
         scope,
         watched_groups: Object.keys(state.groups).length,
         queue: queue.length,
@@ -562,6 +712,8 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
       const o = mediaIdx.oldest[chatJid]
       return { chat: chatJid, oldest_known_message: o ? fmt(o.ts) : null, history, count: files.length, files }
     },
+    xlsxRead,
+    xlsxUpdate,
     async exportChatFiles({ chat, message_ids, folder }) {
       const chatJid = await resolveChat(chat)
       return exportFiles({ chatJid, ids: message_ids, folder })
@@ -620,4 +772,32 @@ export function registerWatcherTools(server, watcher) {
       folder: z.string().describe('Ссылка на папку Google Drive или её ID, которую назвал пользователь'),
     },
     a => watcher.exportChatFiles(a))
+
+  reg('drive_xlsx_read',
+    'Прочитать .xlsx-файл с Google Drive: список листов и строки выбранного листа (значения и формулы, до 300 строк за раз). ' +
+    'Нужен перед drive_xlsx_update, чтобы увидеть структуру, последние строки и формулы итогов.',
+    {
+      file: z.string().describe('Ссылка на файл Drive/Sheets или его ID'),
+      sheet: z.string().optional().describe('Имя листа (по умолчанию первый)'),
+      from_row: z.number().int().optional(),
+      to_row: z.number().int().optional(),
+    },
+    a => watcher.xlsxRead(a))
+
+  reg('drive_xlsx_update',
+    'Изменить .xlsx-файл на Google Drive на месте (ссылка и ID файла не меняются, старая версия остаётся в истории версий Drive). ' +
+    'Можно вставить пустые строки (стиль копируется со строки style_from_row) и записать значения/формулы в ячейки. ' +
+    'Формулы при вставке строк автоматически НЕ сдвигаются — перепишите итоговые формулы явно. Только по просьбе пользователя.',
+    {
+      file: z.string().describe('Ссылка на файл Drive/Sheets или его ID'),
+      sheet: z.string().optional(),
+      insert_rows: z.object({ before_row: z.number().int().min(1), count: z.number().int().min(1).max(200), style_from_row: z.number().int().optional() }).optional(),
+      cells: z.array(z.object({
+        ref: z.string().describe('Адрес ячейки, например A172'),
+        value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+        formula: z.string().optional().describe('Формула, например SUM(G2:G180)'),
+        date: z.string().optional().describe('Дата ГГГГ-ММ-ДД, записывается как дата Excel'),
+      })).max(2000).optional(),
+    },
+    a => watcher.xlsxUpdate(a))
 }
