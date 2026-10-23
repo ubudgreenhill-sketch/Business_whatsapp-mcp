@@ -42,7 +42,16 @@ const log = pino({ level: process.env.LOG_LEVEL || 'info' })
 const waLogger = pino({ level: 'warn' })
 
 // ---------- group files -> Google Drive (folders are assigned manually at /groups/<SECRET>) ----------
-const watcher = createGroupWatcher({ dataDir: DATA_DIR, secret: SECRET, logger: log })
+const watcher = createGroupWatcher({
+  dataDir: DATA_DIR,
+  secret: SECRET,
+  logger: log,
+  // oldest message we know in a chat — starting point for loading older history from the phone
+  oldestKnown: (jid) => {
+    const m = (store.messages[jid] || [])[0]
+    return m ? { ts: m.ts, key: { remoteJid: jid, id: m.id, fromMe: !!m.fromMe } } : null
+  },
+})
 
 // ---------- local store (contacts, chats, recent messages) ----------
 // keyed by canonical JID: phone JID (xxx@s.whatsapp.net) when known, otherwise lid/group JID

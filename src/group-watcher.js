@@ -8,6 +8,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { z } from 'zod'
 
 const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink&supportsAllDrives=true'
 const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files'
@@ -103,7 +104,7 @@ async function readForm(req) {
 
 // ---------- основной объект ----------
 
-export function createGroupWatcher({ dataDir, secret, publicUrl, logger = console, timeZone = 'Asia/Makassar', downloadMedia }) {
+export function createGroupWatcher({ dataDir, secret, publicUrl, logger = console, timeZone = 'Asia/Makassar', downloadMedia, oldestKnown }) {
   if (!dataDir) throw new Error('group-watcher: dataDir обязателен')
   if (!secret) throw new Error('group-watcher: secret обязателен')
   const statePath = path.join(dataDir, 'group-watch.json')
@@ -389,9 +390,142 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     } finally { working = false }
   }
 
+  // ---------- индекс файлов (для разовой выгрузки прошлых документов) ----------
+  // Храним сами сообщения с документами и фото (без превью), чтобы потом их можно было скачать.
+  const mediaPath = path.join(dataDir, 'media-index.json')
+  const MAX_MEDIA_PER_CHAT = 800
+  const reviver = (_, v) => (v && typeof v === 'object' && v.type === 'Buffer' && typeof v.data === 'string' ? Buffer.from(v.data, 'base64') : v)
+  const replacer = (_, v) => (v && (Buffer.isBuffer(v) || v instanceof Uint8Array || v.type === 'Buffer') ? { type: 'Buffer', data: Buffer.from(v.data || v).toString('base64') } : v)
+  let mediaIdx = { chats: {}, oldest: {} }
+  try { mediaIdx = { chats: {}, oldest: {}, ...JSON.parse(fs.readFileSync(mediaPath, 'utf8'), reviver) } } catch {}
+  let mediaTimer = null
+  const historyWaiters = new Set()
+  function saveMediaSoon() {
+    if (mediaTimer) return
+    mediaTimer = setTimeout(() => {
+      mediaTimer = null
+      try {
+        fs.mkdirSync(dataDir, { recursive: true })
+        fs.writeFileSync(mediaPath + '.tmp', JSON.stringify(mediaIdx, replacer))
+        fs.renameSync(mediaPath + '.tmp', mediaPath)
+      } catch (e) { logger.error?.(`[group-watcher] media index: ${e.message}`) }
+    }, 3000)
+  }
+  function stripThumbs(o) {
+    if (!o || typeof o !== 'object') return o
+    for (const k of Object.keys(o)) {
+      if (k === 'jpegThumbnail' || k === 'thumbnailSha256' || k === 'thumbnailEncSha256' || k === 'contextInfo') delete o[k]
+      else if (o[k] && typeof o[k] === 'object' && !Buffer.isBuffer(o[k]) && !(o[k] instanceof Uint8Array)) stripThumbs(o[k])
+    }
+    return o
+  }
+  function indexMessages(messages) {
+    let changed = false
+    for (const msg of messages || []) {
+      const chat = bare(msg?.key?.remoteJid)
+      if (!chat || chat === 'status@broadcast' || !msg.key.id) continue
+      const ts = Number(msg.messageTimestamp || 0)
+      if (ts) {
+        const o = mediaIdx.oldest[chat]
+        if (!o || ts < o.ts) { mediaIdx.oldest[chat] = { ts, key: { remoteJid: msg.key.remoteJid, id: msg.key.id, fromMe: !!msg.key.fromMe } }; changed = true }
+      }
+      const media = extractMedia(msg.message)
+      if (!media) continue
+      const list = mediaIdx.chats[chat] || (mediaIdx.chats[chat] = {})
+      if (list[msg.key.id]) continue
+      let raw
+      try { raw = stripThumbs(JSON.parse(JSON.stringify(msg, replacer), reviver)) } catch { continue }
+      list[msg.key.id] = { ts, kind: media.kind, fileName: media.fileName, mimetype: media.mimetype, caption: media.caption, sender: senderName(msg), raw }
+      const ids = Object.keys(list)
+      if (ids.length > MAX_MEDIA_PER_CHAT) ids.sort((a, b) => list[a].ts - list[b].ts).slice(0, ids.length - MAX_MEDIA_PER_CHAT).forEach(id => delete list[id])
+      changed = true
+    }
+    if (changed) saveMediaSoon()
+  }
+
+  async function resolveChat(chat) {
+    const q = String(chat || '').trim()
+    if (!q) throw new Error('Укажите чат')
+    if (q.includes('@')) return bare(q)
+    const digits = q.replace(/[^\d]/g, '')
+    if (digits.length >= 7 && digits.length === q.replace(/[\s+()-]/g, '').length) return `${digits}@s.whatsapp.net`
+    if (!sock) throw new Error('WhatsApp ещё не подключён')
+    const all = Object.values(await sock.groupFetchAllParticipating())
+    const low = q.toLowerCase()
+    const exact = all.filter(g => (g.subject || '').toLowerCase() === low)
+    const found = exact.length ? exact : all.filter(g => (g.subject || '').toLowerCase().includes(low))
+    if (found.length === 1) return found[0].id
+    throw new Error(found.length ? `Под «${q}» подходит несколько групп: ${found.slice(0, 8).map(g => `«${g.subject}» (${g.id})`).join(', ')}` : `Группа «${q}» не найдена. Передайте jid чата.`)
+  }
+
+  const toTs = (d, end) => {
+    if (!d) return null
+    const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(d) ? `${d}T${end ? '23:59:59' : '00:00:00'}+08:00` : d)
+    if (Number.isNaN(t)) throw new Error(`Не понимаю дату «${d}», нужен формат ГГГГ-ММ-ДД`)
+    return Math.floor(t / 1000)
+  }
+  const fmt = ts => new Date(ts * 1000).toLocaleString('sv-SE', { timeZone }).slice(0, 16)
+
+  function listFiles({ chatJid, since, until }) {
+    const list = Object.entries(mediaIdx.chats[chatJid] || {})
+      .filter(([, m]) => (!since || m.ts >= since) && (!until || m.ts <= until))
+      .sort((a, b) => a[1].ts - b[1].ts)
+    return list.map(([id, m]) => ({ message_id: id, date: fmt(m.ts), kind: m.kind === 'image' ? 'photo' : 'document', file_name: m.fileName, caption: m.caption || undefined, sender: m.sender, mimetype: m.mimetype }))
+  }
+
+  /** Подтягивает с телефона историю чата (порциями по 50 сообщений), пока не дойдёт до нужной даты. */
+  async function fetchHistory(chatJid, sinceTs, maxRounds = 5) {
+    if (!sock?.fetchMessageHistory) throw new Error('WhatsApp ещё не подключён')
+    let rounds = 0
+    for (; rounds < maxRounds; rounds++) {
+      let o = mediaIdx.oldest[chatJid]
+      const ext = oldestKnown?.(chatJid)
+      if (ext?.ts && (!o || ext.ts < o.ts)) o = ext
+      if (!o) throw new Error('Не найдено ни одного сообщения этого чата, от которого можно начать загрузку истории')
+      if (o.ts <= sinceTs) break
+      const before = o.ts
+      const got = new Promise(resolve => {
+        const w = msgs => { if ((msgs || []).some(m => bare(m?.key?.remoteJid) === chatJid)) { historyWaiters.delete(w); resolve(true) } }
+        historyWaiters.add(w)
+        setTimeout(() => { historyWaiters.delete(w); resolve(false) }, 20_000)
+      })
+      await sock.fetchMessageHistory(50, o.key, o.ts * 1000)
+      const ok = await got
+      await new Promise(r => setTimeout(r, 1500))
+      const now = mediaIdx.oldest[chatJid]?.ts
+      if (!ok || !now || now >= before) break
+    }
+    const o = mediaIdx.oldest[chatJid]
+    return { rounds, oldest_message_date: o ? fmt(o.ts) : null, reached_requested_date: !!(o && o.ts <= sinceTs) }
+  }
+
+  async function exportFiles({ chatJid, ids, folder }) {
+    const folderId = parseFolderId(folder)
+    if (!folderId) throw new Error('Не похоже на ссылку на папку Google Drive')
+    const f = await getFolder(folderId)
+    const results = []
+    for (const id of ids) {
+      const m = mediaIdx.chats[chatJid]?.[id]
+      if (!m) { results.push({ message_id: id, ok: false, error: 'нет в индексе — сначала list_chat_files' }); continue }
+      try {
+        const buffer = await downloadBuffer(m.raw)
+        const name = buildFileName({ ts: m.ts, sender: m.sender, media: { kind: m.kind, mimetype: m.mimetype, fileName: m.fileName, caption: m.caption }, msgId: id, tz: timeZone })
+        const up = await uploadFile({ folderId: f.id, name, mimetype: m.mimetype, buffer, description: m.caption ? `Подпись: ${m.caption}` : undefined })
+        results.push({ message_id: id, ok: true, name: up.name, link: up.webViewLink })
+      } catch (e) {
+        results.push({ message_id: id, ok: false, file_name: m.fileName, error: String(e.message || e) })
+      }
+    }
+    return { folder: f.name, folder_link: f.webViewLink, uploaded: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, results }
+  }
+
   function attach(newSock) {
     sock = newSock
-    sock.ev.on('messages.upsert', onUpsert)
+    sock.ev.on('messages.upsert', e => { indexMessages(e?.messages); return onUpsert(e) })
+    sock.ev.on('messaging-history.set', e => {
+      indexMessages(e?.messages)
+      for (const w of [...historyWaiters]) w(e?.messages)
+    })
   }
 
   // ---------- действия для MCP ----------
@@ -409,6 +543,21 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
         queue: queue.length,
       }
     },
+    async listChatFiles({ chat, since, until, fetch_older }) {
+      const chatJid = await resolveChat(chat)
+      const s = toTs(since), u = toTs(until, true)
+      let history
+      if (fetch_older !== false && s) {
+        try { history = await fetchHistory(chatJid, s) } catch (e) { history = { error: String(e.message || e) } }
+      }
+      const files = listFiles({ chatJid, since: s, until: u })
+      const o = mediaIdx.oldest[chatJid]
+      return { chat: chatJid, oldest_known_message: o ? fmt(o.ts) : null, history, count: files.length, files }
+    },
+    async exportChatFiles({ chat, message_ids, folder }) {
+      const chatJid = await resolveChat(chat)
+      return exportFiles({ chatJid, ids: message_ids, folder })
+    },
     list() {
       return Object.entries(state.groups).map(([jid, g]) => ({
         chat: g.name, type: g.kind === 'contact' ? 'contact' : 'group', chat_id: jid, folder: g.folderName, folder_link: g.folderLink, paused: !!g.paused,
@@ -417,6 +566,7 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     },
     // для тестов
     _onUpsert: onUpsert,
+    _media: () => mediaIdx,
     _state: () => state,
   }
 }
@@ -439,4 +589,27 @@ export function registerWatcherTools(server, watcher) {
     'Какие группы и контакты WhatsApp отслеживаются, в какие папки Google Drive идут из них документы и фото, сколько сохранено и были ли ошибки. ' +
     'Только просмотр: назначать и менять папки может лишь сам пользователь на странице настроек /groups/<SECRET>.',
     {}, () => watcher.list())
+
+  reg('list_chat_files',
+    'Список документов и фото в чате WhatsApp (группе или контакте) за период: дата, отправитель, имя файла, подпись, message_id. ' +
+    'Если указан since, сначала подтягивает с телефона более старую историю чата (до 5 порций по 50 сообщений за вызов). Если history.reached_requested_date=false, вызовите ещё раз — загрузка продолжится. ' +
+    'Используйте перед export_chat_files, чтобы выбрать нужные файлы (например, только инвойсы).',
+    {
+      chat: z.string().describe('jid чата (…@g.us, …@s.whatsapp.net), номер телефона или название группы'),
+      since: z.string().optional().describe('С какой даты, ГГГГ-ММ-ДД (по времени Бали)'),
+      until: z.string().optional().describe('По какую дату включительно, ГГГГ-ММ-ДД'),
+      fetch_older: z.boolean().optional().describe('Подтягивать старую историю с телефона (по умолчанию да)'),
+    },
+    a => watcher.listChatFiles(a))
+
+  reg('export_chat_files',
+    'Разово скачать выбранные файлы из чата WhatsApp и загрузить их в указанную папку Google Drive. ' +
+    'Вызывайте только по прямой просьбе пользователя в чате и только в папку, которую он сам назвал. ' +
+    'Автоматические настройки сбора (страница /groups/<SECRET>) этот инструмент не меняет.',
+    {
+      chat: z.string().describe('Тот же чат, что в list_chat_files'),
+      message_ids: z.array(z.string()).min(1).max(100).describe('message_id из list_chat_files'),
+      folder: z.string().describe('Ссылка на папку Google Drive или её ID, которую назвал пользователь'),
+    },
+    a => watcher.exportChatFiles(a))
 }
