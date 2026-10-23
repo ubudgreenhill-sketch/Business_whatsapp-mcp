@@ -1,6 +1,6 @@
-// group-watcher.js — слушает выбранные группы WhatsApp и складывает документы и фото в папки Google Drive.
+// group-watcher.js — слушает выбранные группы и контакты WhatsApp и складывает документы и фото в папки Google Drive.
 //
-// Папка для каждой группы назначается ТОЛЬКО вручную — на странице https://<домен>/groups/<SECRET>.
+// Папка для каждой группы или контакта назначается ТОЛЬКО вручную — на странице https://<домен>/groups/<SECRET>.
 // Через Claude (MCP) настройки можно только смотреть, менять нельзя.
 //
 // Подключено в src/index.js: createGroupWatcher(), watcher.attach(sock), watcher.handleHttp(), registerWatcherTools().
@@ -191,36 +191,43 @@ export function createGroupWatcher({ dataDir, secret, publicUrl, logger = consol
       if (!sock) throw new Error('WhatsApp ещё не подключён')
       groups = Object.values(await sock.groupFetchAllParticipating()).map(g => ({ id: g.id, name: g.subject || g.id }))
     } catch (e) { waError = String(e.message || e) }
-    for (const [id, g] of Object.entries(state.groups)) if (!groups.some(x => x.id === id)) groups.push({ id, name: `${g.name} (нет в списке групп)` })
+    for (const [id, g] of Object.entries(state.groups)) if (g.kind !== 'contact' && !groups.some(x => x.id === id)) groups.push({ id, name: `${g.name} (нет в списке групп)` })
     groups.sort((a, b) => (state.groups[b.id] ? 1 : 0) - (state.groups[a.id] ? 1 : 0) || a.name.localeCompare(b.name))
+    const contacts = Object.entries(state.groups).filter(([, g]) => g.kind === 'contact').map(([id, g]) => ({ id, name: `${g.name}${g.phone ? ` (+${g.phone})` : ''}` }))
     const drive = state.google?.refresh_token
       ? '✅ Google Drive подключён'
       : `⚠️ Google Drive не подключён — <a href="/gdrive/connect/${esc(secret)}">подключить</a>`
-    const rows = groups.map(g => {
+    const row = g => {
       const w = state.groups[g.id]
       const cur = w ? `<div class="cur">→ <a href="${esc(w.folderLink)}" target="_blank" rel="noreferrer">${esc(w.folderName)}</a> · сохранено: ${w.saved || 0}${w.paused ? ' · <b>пауза</b>' : ''}${w.lastError ? `<br><span class="err">Ошибка: ${esc(w.lastError.message)}</span>` : ''}</div>` : ''
       return `<form method="post" class="row"><input type="hidden" name="group_id" value="${esc(g.id)}">
 <div class="name">${esc(g.name)}</div>${cur}
 <div class="ctl"><input name="folder" placeholder="Ссылка на папку Google Drive" value="${w ? esc(w.folderLink || w.folderId) : ''}">
 <button name="action" value="save">Сохранить</button>${w ? `<button name="action" value="${w.paused ? 'resume' : 'pause'}">${w.paused ? 'Возобновить' : 'Пауза'}</button><button name="action" value="remove" class="danger">Отключить</button>` : ''}</div></form>`
-    }).join('')
+    }
+    const addContact = `<form method="post" class="row"><input type="hidden" name="action" value="add_contact">
+<div class="name">Добавить контакт</div>
+<div class="ctl"><input name="phone" inputmode="tel" placeholder="Номер, напр. +62 812 3456 7890" style="min-width:180px"><input name="label" placeholder="Имя (необязательно)" style="min-width:140px"></div>
+<div class="ctl"><input name="folder" placeholder="Ссылка на папку Google Drive"><button>Добавить</button></div></form>`
+    const rows = `<h2>Контакты</h2>${contacts.map(row).join('')}${addContact}<h2>Группы</h2>${groups.map(row).join('') || '<p>Групп пока нет.</p>'}`
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
     res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Группы → папки</title>
-<style>body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px;color:#222}h1{font-size:20px}.row{border:1px solid #ddd;border-radius:8px;padding:10px 12px;margin:8px 0}
+<style>body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px;color:#222}h1{font-size:20px}h2{font-size:17px;margin:22px 0 6px}.row{border:1px solid #ddd;border-radius:8px;padding:10px 12px;margin:8px 0}
 .name{font-weight:600}.cur{margin:4px 0;color:#555}.ctl{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.ctl input{flex:1;min-width:200px;padding:6px}button{padding:6px 10px;cursor:pointer}
 .danger{color:#b00}.msg{padding:8px 12px;border-radius:6px;background:#eef6ee}.msg.bad{background:#fbeaea}.err{color:#b00}</style>
-<h1>Группы WhatsApp → папки Google Drive</h1><p>${drive}</p>
-<p>Откройте нужную папку в Google Drive, скопируйте адрес из браузера, вставьте напротив группы и нажмите «Сохранить». Из группы будут сохраняться новые документы и фото.</p>
+<h1>WhatsApp → папки Google Drive</h1><p>${drive}</p>
+<p>Откройте нужную папку в Google Drive, скопируйте адрес из браузера, вставьте напротив группы или контакта и нажмите «Сохранить». Из этого чата будут сохраняться новые документы и фото (и входящие, и ваши).</p>
 ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waError ? `<p class="msg bad">${esc(waError)}</p>` : ''}${rows}`)
   }
 
   async function handleSettingsPost(req) {
     const f = await readForm(req)
+    if (f.action === 'add_contact') return addContact(f)
     const id = String(f.group_id || '')
-    if (!id.endsWith('@g.us')) return { bad: true, text: 'Неверная группа' }
+    if (!/@(g\.us|s\.whatsapp\.net|lid)$/.test(id)) return { bad: true, text: 'Неверный чат' }
     const g = state.groups[id]
     if (f.action === 'remove') {
-      if (!g) return { text: 'Группа и так не отслеживается' }
+      if (!g) return { text: 'Чат и так не отслеживается' }
       delete state.groups[id]; save()
       return { text: `«${g.name}» больше не отслеживается` }
     }
@@ -234,10 +241,33 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     let folder
     try { folder = await getFolder(folderId) } catch (e) { return { bad: true, text: `Папка недоступна: ${e.message}` } }
     let name = g?.name
-    try { name = (await sock?.groupMetadata(id))?.subject || name } catch {}
-    state.groups[id] = { ...(g || {}), name: name || id, folderId: folder.id, folderName: folder.name, folderLink: folder.webViewLink, since: g?.since || new Date().toISOString(), paused: g?.paused || false }
+    if (id.endsWith('@g.us')) try { name = (await sock?.groupMetadata(id))?.subject || name } catch {}
+    state.groups[id] = { ...(g || {}), kind: g?.kind || (id.endsWith('@g.us') ? 'group' : 'contact'), name: name || id, folderId: folder.id, folderName: folder.name, folderLink: folder.webViewLink, since: g?.since || new Date().toISOString(), paused: g?.paused || false }
     save()
     return { text: `«${state.groups[id].name}» → папка «${folder.name}»` }
+  }
+
+  async function addContact(f) {
+    const phone = String(f.phone || '').replace(/[^\d]/g, '')
+    if (phone.length < 7) return { bad: true, text: 'Укажите номер телефона в международном формате' }
+    const folderId = parseFolderId(f.folder)
+    if (!folderId) return { bad: true, text: 'Не похоже на ссылку на папку Google Drive' }
+    if (!sock) return { bad: true, text: 'WhatsApp ещё не подключён' }
+    let jid = `${phone}@s.whatsapp.net`
+    try {
+      const [r] = (await sock.onWhatsApp(phone)) || []
+      if (r && !r.exists) return { bad: true, text: `Номер +${phone} не зарегистрирован в WhatsApp` }
+      if (r?.jid) jid = r.jid
+    } catch {}
+    let lid = null
+    try { lid = (await sock.signalRepository?.lidMapping?.getLIDForPN?.(jid)) || null } catch {}
+    let folder
+    try { folder = await getFolder(folderId) } catch (e) { return { bad: true, text: `Папка недоступна: ${e.message}` } }
+    const g = state.groups[jid]
+    const name = String(f.label || '').trim() || g?.name || `+${phone}`
+    state.groups[jid] = { ...(g || {}), kind: 'contact', phone, lid: lid || g?.lid || null, name, folderId: folder.id, folderName: folder.name, folderLink: folder.webViewLink, since: g?.since || new Date().toISOString(), paused: g?.paused || false }
+    save()
+    return { text: `«${name}» → папка «${folder.name}»` }
   }
 
   async function handleHttp(req, res) {
@@ -283,19 +313,41 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
   // ---------- обработка входящих ----------
 
   function senderName(msg) {
-    return msg.pushName || (msg.key.fromMe ? 'я' : (msg.key.participant || '').split('@')[0])
+    if (msg.key.fromMe) return 'я'
+    return msg.pushName || (msg.key.participant || msg.key.remoteJid || '').split('@')[0]
   }
 
-  function onUpsert({ messages, type }) {
+  const bare = j => (j ? String(j).replace(/:\d+@/, '@') : j)
+
+  /** Ключ отслеживаемого чата для сообщения: группа, контакт по номеру или по LID. */
+  async function watchedKey(key) {
+    const cands = [key.remoteJid, key.remoteJidAlt].filter(Boolean).map(bare)
+    for (const c of cands) if (state.groups[c]) return c
+    for (const c of cands) {
+      const hit = Object.entries(state.groups).find(([, g]) => g.kind === 'contact' && g.lid && bare(g.lid) === c)
+      if (hit) return hit[0]
+    }
+    const lid = cands.find(c => c.endsWith('@lid'))
+    if (lid && Object.values(state.groups).some(g => g.kind === 'contact')) {
+      try {
+        const pn = bare(await sock?.signalRepository?.lidMapping?.getPNForLID?.(lid))
+        if (pn && state.groups[pn]) { state.groups[pn].lid = lid; return pn }
+      } catch {}
+    }
+    return null
+  }
+
+  async function onUpsert({ messages, type }) {
     if (type !== 'notify' && type !== 'append') return
     for (const msg of messages || []) {
-      const jid = msg.key?.remoteJid
+      if (!msg.key?.remoteJid || msg.key.remoteJid === 'status@broadcast') continue
+      const media = extractMedia(msg.message)
+      if (!media) continue
+      const jid = await watchedKey(msg.key)
       const g = jid && state.groups[jid]
       if (!g || g.paused) continue
       const id = `${jid}|${msg.key.id}`
       if (seen.has(id)) continue
-      const media = extractMedia(msg.message)
-      if (!media) continue
       seen.add(id)
       queue.push({ msg, media, jid, tries: 0 })
     }
@@ -351,7 +403,7 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
       return {
         google_drive_connected: !!state.google?.refresh_token,
         connect_url: state.google?.refresh_token ? undefined : `${baseUrl}/gdrive/connect/<SECRET>`,
-        settings: 'Папки назначаются только вручную на странице /groups/<SECRET>',
+        settings: 'Папки для групп и контактов назначаются только вручную на странице /groups/<SECRET>',
         scope,
         watched_groups: Object.keys(state.groups).length,
         queue: queue.length,
@@ -359,7 +411,7 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     },
     list() {
       return Object.entries(state.groups).map(([jid, g]) => ({
-        group: g.name, group_id: jid, folder: g.folderName, folder_link: g.folderLink, paused: !!g.paused,
+        chat: g.name, type: g.kind === 'contact' ? 'contact' : 'group', chat_id: jid, folder: g.folderName, folder_link: g.folderLink, paused: !!g.paused,
         files_saved: g.saved || 0, failed: g.failed || 0, last_file: g.lastFile || null, last_error: g.lastError || null,
       }))
     },
@@ -384,7 +436,7 @@ export function registerWatcherTools(server, watcher) {
   reg('drive_status', 'Подключён ли Google Drive и сколько групп отслеживается.', {}, () => watcher.driveStatus())
 
   reg('list_watched_groups',
-    'Какие группы WhatsApp отслеживаются, в какие папки Google Drive идут из них файлы, сколько сохранено и были ли ошибки. ' +
+    'Какие группы и контакты WhatsApp отслеживаются, в какие папки Google Drive идут из них документы и фото, сколько сохранено и были ли ошибки. ' +
     'Только просмотр: назначать и менять папки может лишь сам пользователь на странице настроек /groups/<SECRET>.',
     {}, () => watcher.list())
 }
