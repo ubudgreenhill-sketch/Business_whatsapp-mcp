@@ -658,26 +658,35 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     }
     const p = localParts(new Date())
     job.lastRun = `${p.year}-${p.month}-${p.day} ${p.hour}:00${manual ? ' (вручную)' : ''}`
-    job.lastRunDay = manual ? job.lastRunDay : `${p.year}-${p.month}-${p.day}`
     job.lastResult = text
     save()
     logger.info?.(`[group-watcher] weekly ${job.name}: ${text}`)
     return text
   }
+  // Последний плановый момент «пятница 18:00 по Бали» (UTC+8 → пятница 10:00 UTC), не позже now
+  function lastFridaySlot(now = Date.now()) {
+    const t = new Date(now)
+    t.setUTCHours(10, 0, 0, 0)
+    while (t.getUTCDay() !== 5 || t.getTime() > now) t.setUTCDate(t.getUTCDate() - 1)
+    return t.getTime()
+  }
   let weeklyBusy = false
-  setInterval(async () => {
+  // Проверка каждые 5 минут: если плановый запуск пропущен (сервер был выключен, WhatsApp не подключён) —
+  // выполняем его при первой возможности, даже в субботу или позже.
+  async function weeklyTick() {
     if (weeklyBusy || !sock || !state.google?.refresh_token) return
-    const p = localParts(new Date())
-    if (p.weekday !== 'Fri' || Number(p.hour === '24' ? 0 : p.hour) < 18) return
-    const day = `${p.year}-${p.month}-${p.day}`
+    const slot = lastFridaySlot()
     weeklyBusy = true
     try {
       for (const job of state.weekly || []) {
-        if (job.lastRunDay === day) continue
-        try { await runWeekly(job) } catch (e) { job.lastResult = `ошибка: ${e.message}`; job.lastRunDay = day; save() }
+        const last = job.lastAutoTs || Date.parse(job.created || 0) || 0
+        if (last >= slot) continue
+        try { await runWeekly(job); job.lastAutoTs = Date.now(); save() }
+        catch (e) { job.lastResult = `ошибка: ${e.message} (повтор через 5 мин)`; save() }
       }
     } finally { weeklyBusy = false }
-  }, 5 * 60_000).unref?.()
+  }
+  setInterval(weeklyTick, 5 * 60_000).unref?.()
 
   function attach(newSock) {
     sock = newSock
@@ -730,6 +739,8 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
     // для тестов
     _onUpsert: onUpsert,
     _media: () => mediaIdx,
+    _weeklyTick: () => weeklyTick(),
+    _lastFridaySlot: lastFridaySlot,
     _state: () => state,
   }
 }
