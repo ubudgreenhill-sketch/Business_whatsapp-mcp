@@ -233,6 +233,7 @@ export function createGroupWatcher({ dataDir, secret, publicUrl, logger = consol
       else cell.value = c.value ?? null
       n++
     }
+    wb.calcProperties = { ...(wb.calcProperties || {}), fullCalcOnLoad: true }
     const buf = Buffer.from(await wb.xlsx.writeBuffer())
     const token = await getAccessToken()
     const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(id)}?uploadType=media&supportsAllDrives=true&fields=id,name,modifiedTime`, {
@@ -490,6 +491,8 @@ ${msg ? `<p class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</p>` : ''}${waE
           const buffer = await downloadBuffer(job.msg)
           const name = buildFileName({ ts: job.msg.messageTimestamp, sender: senderName(job.msg), media: job.media, msgId: job.msg.key.id, tz: timeZone })
           const f = await uploadFile({ folderId: g.folderId, name, mimetype: job.media.mimetype, buffer, description: job.media.caption ? `Подпись: ${job.media.caption}` : undefined })
+          state.exported = state.exported || {}
+          state.exported[`${job.jid}|${job.msg.key.id}`] = new Date().toISOString()
           g.saved = (g.saved || 0) + 1
           g.lastFile = { name: f.name, link: f.webViewLink, at: new Date().toISOString() }
           g.lastError = null
